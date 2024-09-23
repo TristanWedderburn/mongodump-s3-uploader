@@ -6,7 +6,6 @@ import java.time.ZoneId;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.*;
-import org.apache.commons.lang3.time.DateUtils;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 
@@ -39,6 +38,8 @@ public class MongodumpS3Uploader {
     // Method to upload the data from the mongodump input stream to S3 using multipart upload
     public static void multipartUploadWithS3Client(S3Client s3Client, String bucketName, String key, InputStream inputStream) throws IOException {
 
+        long startUploadTime = System.nanoTime(); // Start timer for entire upload
+
         // Step 1: Initiate the multipart upload
         final CreateMultipartUploadResponse createMultipartUploadResponse = s3Client.createMultipartUpload(CreateMultipartUploadRequest.builder()
                 .bucket(bucketName)
@@ -46,25 +47,44 @@ public class MongodumpS3Uploader {
                 .build());
         final String uploadId = createMultipartUploadResponse.uploadId();
 
-        // Step 2: TODO: Determine the optimal part size based on the total data size
-        final int partSize = PART_SIZE;
-        System.out.println("Using part size: " + partSize + " bytes");
-
         // Prepare to upload the file in parts
         final List<CompletedPart> completedParts = new ArrayList<>();
-        byte[] buffer = new byte[partSize];  // Buffer to hold data for each part
+        byte[] buffer = new byte[PART_SIZE];  // Buffer to hold data for each part
         int partNumber = 1;
         int bytesRead;
         int currentBufferSize = 0;
         long totalBytesUploaded = 0;
 
+        // For perf. analysis
+        int readCount = 0;
+        int uploadCount = 0;
+        long totalReadTime = 0;
+        long totalUploadTime = 0;
+
         try {
-            while ((bytesRead = inputStream.read(buffer, currentBufferSize, buffer.length - currentBufferSize)) != -1) {
+            while (true) {
+                // Measure time for reading from InputStream
+                long startReadTime = System.nanoTime();
+                bytesRead = inputStream.read(buffer, currentBufferSize, buffer.length - currentBufferSize);
+                long endReadTime = System.nanoTime();
+                totalReadTime += (endReadTime - startReadTime);
+                readCount++;
+
+                if (bytesRead == -1) {
+                    break; // End of stream
+                }
+
                 currentBufferSize += bytesRead;
 
                 // Only upload the part when the buffer reaches or exceeds the part size
-                if (currentBufferSize >= partSize) {
-                    uploadPart(s3Client, bucketName, key, uploadId, buffer, partNumber, currentBufferSize);
+                if (currentBufferSize >= PART_SIZE) {
+                    long startUploadPartTime = System.nanoTime();  // Start timer for each part upload
+                    uploadPart(s3Client, bucketName, key, uploadId, buffer, partNumber, currentBufferSize, completedParts);
+                    long endUploadPartTime = System.nanoTime();  // End timer for each part upload
+
+                    totalUploadTime += (endUploadPartTime - startUploadPartTime);
+                    uploadCount++;
+
                     totalBytesUploaded += currentBufferSize;
                     currentBufferSize = 0; // Reset buffer after part upload
                     partNumber++;
@@ -73,10 +93,23 @@ public class MongodumpS3Uploader {
 
             // Handle the final part if it didn't reach the full part size
             if (currentBufferSize > 0) {
-                uploadPart(s3Client, bucketName, key, uploadId, buffer, partNumber, currentBufferSize);
+                long startUploadPartTime = System.nanoTime();  // Start timer for final part
+                uploadPart(s3Client, bucketName, key, uploadId, buffer, partNumber, currentBufferSize, completedParts);
+                long endUploadPartTime = System.nanoTime();  // End timer for final part
+
+                totalUploadTime += (endUploadPartTime - startUploadPartTime);
+                uploadCount++;
+
                 totalBytesUploaded += currentBufferSize;
                 partNumber++;
             }
+
+            long endUploadTime = System.nanoTime();  // End timer for entire upload
+
+            System.out.println("Total data uploaded: " + totalBytesUploaded + " bytes");
+            System.out.println("Average time spent reading from InputStream: " + (totalReadTime / readCount) / 1e6 + " ms (for " + readCount + " reads)");
+            System.out.println("Average time spent uploading parts: " + (totalUploadTime / uploadCount) / 1e6 + " ms (for " + uploadCount + " uploads)");
+            System.out.println("Total time for the entire upload process: " + (endUploadTime - startUploadTime) / 1e6 + " ms");
 
         } catch (IOException e) {
             System.err.println("Error reading input stream or uploading parts: " + e.getMessage());
@@ -103,7 +136,7 @@ public class MongodumpS3Uploader {
     }
 
     // Helper method to upload part
-    private static void uploadPart(S3Client s3Client, String bucketName, String key, String uploadId, byte[] buffer, int partNumber, int bufferSize) {
+    private static void uploadPart(S3Client s3Client, String bucketName, String key, String uploadId, byte[] buffer, int partNumber, int bufferSize, List<CompletedPart> completedParts) {
         final ByteBuffer byteBuffer = ByteBuffer.wrap(buffer, 0, bufferSize);  // Wrap the buffer for the part
 
         final UploadPartRequest uploadPartRequest = UploadPartRequest.builder()
@@ -116,11 +149,12 @@ public class MongodumpS3Uploader {
 
         final UploadPartResponse uploadPartResponse = s3Client.uploadPart(uploadPartRequest, RequestBody.fromByteBuffer(byteBuffer));
 
-        final CompletedPart part = CompletedPart.builder()
+        final CompletedPart completedPart = CompletedPart.builder()
                 .partNumber(partNumber)
                 .eTag(uploadPartResponse.eTag())
                 .build();
-        System.out.println("Uploaded part " + partNumber + " (size: " + bufferSize + " bytes)");
+        completedParts.add(completedPart);
+        System.out.println("Uploaded part " + partNumber + " (size: " + bufferSize + " bytes) with eTag: " + uploadPartResponse.eTag());
     }
 
     // Helper method to abort a multipart upload in case of failure
@@ -153,6 +187,8 @@ public class MongodumpS3Uploader {
             .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
             .withZone(ZoneId.of("UTC"))
             .format(now);
+
+        System.out.println("S3 object key: " + formattedTimestamp);
 
         try {
             final InputStream dumpInputStream = runMongoDump();
