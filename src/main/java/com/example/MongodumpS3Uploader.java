@@ -49,7 +49,7 @@ public class MongodumpS3Uploader {
 
         // Prepare to upload the file in parts
         final List<CompletedPart> completedParts = new ArrayList<>();
-        byte[] buffer = new byte[PART_SIZE];  // Buffer to hold data for each part
+        byte[] buffer = new byte[PART_SIZE * 2];  // Buffer to hold data for each part
         int partNumber = 1;
         int bytesRead;
         int currentBufferSize = 0;
