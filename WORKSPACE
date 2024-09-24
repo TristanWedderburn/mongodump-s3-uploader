@@ -20,6 +20,8 @@ maven_install(
         "software.amazon.awssdk:auth:2.20.12",
         "software.amazon.awssdk:regions:2.20.12",
         "org.apache.commons:commons-lang3:3.12.0",
+        "io.netty:netty-all:4.1.100.Final",
+        "software.amazon.awssdk:netty-nio-client:2.20.12",
         "org.slf4j:slf4j-api:1.7.30",
         "org.slf4j:slf4j-simple:1.7.30"
     ],

@@ -107,10 +107,9 @@ public class MongodumpS3Uploader {
             long endUploadTime = System.nanoTime();  // End timer for entire upload
 
             System.out.println("Total data uploaded: " + totalBytesUploaded + " bytes");
-            System.out.println("Average time spent reading from InputStream: " + (totalReadTime / readCount) / 1e6 + " ms (for " + readCount + " reads)");
-            System.out.println("Average time spent uploading parts: " + (totalUploadTime / uploadCount) / 1e6 + " ms (for " + uploadCount + " uploads)");
-            System.out.println("Total time for the entire upload process: " + (endUploadTime - startUploadTime) / 1e6 + " ms");
-
+            System.out.println("Average time spent reading from InputStream: " + (totalReadTime / readCount) / 1_000_000_000.0 + " seconds (for " + readCount + " reads)");
+            System.out.println("Average time spent uploading parts: " + (totalUploadTime / uploadCount) / 1_000_000_000.0 + " seconds (for " + uploadCount + " uploads)");
+            System.out.println("Total time for the entire upload process: " + (endUploadTime - startUploadTime) / 1_000_000_000.0 + " seconds");
         } catch (IOException e) {
             System.err.println("Error reading input stream or uploading parts: " + e.getMessage());
             abortMultipartUpload(s3Client, bucketName, key, uploadId);
