@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class AsyncMongodumpS3Uploader {
     private static final int PART_SIZE = 16 * 1024 * 1024;  // 16 MB part size
-    private static final int MAX_CONCURRENT_UPLOADS = 100;  // Max number of concurrent uploads
+    private static final int MAX_CONCURRENT_UPLOADS = 5;  // Max number of concurrent uploads
 
     // Method to execute the mongodump command and return an InputStream
     private static InputStream runMongoDump() throws IOException {
@@ -49,25 +49,35 @@ public class AsyncMongodumpS3Uploader {
         CreateMultipartUploadResponse createMultipartUploadResponse = createMultipartUploadResponseFuture.join();
         String uploadId = createMultipartUploadResponse.uploadId();
         logger.info("Multipart upload initiated with upload ID: " + uploadId);
-
-        List<CompletedPart> completedParts = Collections.synchronizedList(new ArrayList<>());
-        byte[] buffer = new byte[PART_SIZE * 2];
+    
+        // Step 2: Ring buffer design for upload
+        byte[][] ringBuffer = new byte[maxConcurrency][PART_SIZE];
+        // create array of futures that we can check if they're done based on the part number and then clear the buffer
+        CompletableFuture<CompletedPart>[] currentUploads = new CompletableFuture[maxConcurrency];
+        int ringIndex = 0;
         int partNumber = 1;
+
         int bytesRead;
         int currentBufferSize = 0;
 
-        // Concurrency control
-        AtomicInteger inFlightRequests = new AtomicInteger(0);
-        List<CompletableFuture<CompletedPart>> inFlightUploads = new ArrayList<>();
+        List<CompletedPart> completedParts = Collections.synchronizedList(new ArrayList<>());
 
         try {
-            // Step 2: Read from input stream and schedule uploads with concurrency control
             while (true) {
-                // Read data into buffer
-                bytesRead = inputStream.read(buffer, currentBufferSize, PART_SIZE);
+                // Wait for a part to finish if present
+                if (currentUploads[ringIndex] != null && !currentUploads[ringIndex].isDone()) {
+                    logger.info("Waiting for any in-flight upload to complete...");
+                    currentUploads[ringIndex].join();  // Wait for one in-flight upload to complete
+                    logger.info("Waited, resetting index...");
+                    currentUploads[ringIndex] = null;
+                }
+
+                // Read into the current part of the ring buffer
+                byte[] currentPartBuffer = ringBuffer[ringIndex];
+                bytesRead = inputStream.read(currentPartBuffer, currentBufferSize, PART_SIZE - currentBufferSize);
 
                 if (bytesRead == -1 && currentBufferSize == 0) {
-                    // If there's nothing more to read and no data in the buffer, break
+                    // End of stream and no more data to process
                     logger.info("Reached end of stream with no more data to process.");
                     break;
                 }
@@ -77,51 +87,34 @@ public class AsyncMongodumpS3Uploader {
                     currentBufferSize += bytesRead;
                 }
 
-                // If the buffer is full, or we reach EOF and still have data in the buffer
+                // If we filled a part or reached the end of the stream
                 if (currentBufferSize >= PART_SIZE || (bytesRead == -1 && currentBufferSize > 0)) {
                     logger.info("Buffer full or EOF reached for part " + partNumber + ", preparing for upload...");
 
-                    byte[] partData = Arrays.copyOf(buffer, currentBufferSize);  // Copy buffer to avoid overwriting it during upload
-                    // Make request to upload part to S3
-                    CompletableFuture<CompletedPart> uploadFuture = uploadPartAsync(s3AsyncClient, bucketName, key, uploadId, partData, partNumber);
-
-                    inFlightRequests.incrementAndGet();  // Increment in-flight requests counter
-                    inFlightUploads.add(uploadFuture);   // Add future to in-flight list
+                    // Start upload asynchronously
+                    CompletableFuture<CompletedPart> uploadFuture = uploadPartAsync(s3AsyncClient, bucketName, key, uploadId, currentPartBuffer, partNumber);
+                    currentUploads[ringIndex] = uploadFuture;
                     partNumber++;
 
                     // Handle completion of the upload asynchronously
                     uploadFuture.whenComplete((completedPart, throwable) -> {
                         if (throwable != null) {
-                            // TODO: Could handle retrying upload of part and not decrement?
                             logger.severe("Failed to upload part " + completedPart.partNumber() + ": " + throwable.getMessage());
                             throw new CompletionException(throwable);
                         } else {
                             completedParts.add(completedPart);
                             logger.info("Part " + completedPart.partNumber() + " completed.");
-                            inFlightRequests.decrementAndGet();  // Decrement in-flight counter when upload completes
                         }
                     });
 
-                    currentBufferSize = 0;  // Reset buffer after part is scheduled
-
-                    // Check if we've hit the concurrency limit
-                    if (inFlightRequests.get() >= maxConcurrency) {
-                        logger.info("Max concurrency limit reached, waiting...");
-                        // Wait for at least one future to complete using CompletableFuture.anyOf()
-                        CompletableFuture<Void> firstCompleted = CompletableFuture.anyOf(inFlightUploads.toArray(new CompletableFuture[0]))
-                                .thenRun(() -> {
-                                    // Remove any completed futures from the in-flight list
-                                    inFlightUploads.removeIf(CompletableFuture::isDone);
-                                });
-
-                        firstCompleted.join();  // This doesn't block indefinitely, it waits for any in-flight upload to finish
-                    }
+                    currentBufferSize = 0;  // Reset buffer after scheduling
+                    ringIndex = (ringIndex + 1) % maxConcurrency;  // Move to the next part in the ring buffer
                 }
             }
 
-            // Wait for remaining uploads to complete
-            CompletableFuture<Void> allUploads = CompletableFuture.allOf(inFlightUploads.toArray(new CompletableFuture[0]));
-            allUploads.join();  // Await completion of all in-flight uploads
+            // Wait for all uploads to complete
+            CompletableFuture<Void> allUploads = CompletableFuture.allOf(currentUploads);
+            allUploads.join();
 
             // Step 3: Complete the multipart upload
             completedParts.sort(Comparator.comparing(CompletedPart::partNumber));
@@ -142,7 +135,7 @@ public class AsyncMongodumpS3Uploader {
         }
     }
 
-   private static CompletableFuture<CompletedPart> uploadPartAsync(S3AsyncClient s3AsyncClient, String bucketName, String key, String uploadId, byte[] partData, int partNumber) {
+    private static CompletableFuture<CompletedPart> uploadPartAsync(S3AsyncClient s3AsyncClient, String bucketName, String key, String uploadId, byte[] partData, int partNumber) {
         ByteBuffer byteBuffer = ByteBuffer.wrap(partData);
 
         UploadPartRequest uploadPartRequest = UploadPartRequest.builder()
@@ -182,7 +175,7 @@ public class AsyncMongodumpS3Uploader {
 
     public static void main(String[] args) {
         SdkAsyncHttpClient httpClient = NettyNioAsyncHttpClient.builder()
-                .maxConcurrency(150)  // Increase concurrency based on system resources
+                .maxConcurrency(MAX_CONCURRENT_UPLOADS)  // Increase concurrency based on system resources
                 .connectionTimeout(Duration.ofSeconds(120))  // Increased connection timeout
                 .writeTimeout(Duration.ofSeconds(120))  // Increased write timeout
                 .connectionAcquisitionTimeout(Duration.ofSeconds(180))  // Increased acquisition timeout
