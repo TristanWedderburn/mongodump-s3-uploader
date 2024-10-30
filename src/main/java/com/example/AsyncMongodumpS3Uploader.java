@@ -20,7 +20,7 @@ import java.util.logging.Logger;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class AsyncMongodumpS3Uploader {
-    private static final int PART_SIZE = 16 * 1024 * 1024;  // 16 MB part size
+    private static final int PART_SIZE = 100 * 1024 * 1024;  // In MB
     private static final int MAX_CONCURRENT_UPLOADS = 5;  // Max number of concurrent uploads
 
     // Method to execute the mongodump command and return an InputStream
@@ -51,7 +51,7 @@ public class AsyncMongodumpS3Uploader {
         logger.info("Multipart upload initiated with upload ID: " + uploadId);
     
         // Step 2: Ring buffer design for upload
-        byte[][] ringBuffer = new byte[maxConcurrency][PART_SIZE];
+        byte[][] ringBuffer = new byte[maxConcurrency][PART_SIZE * 2];
         // create array of futures that we can check if they're done based on the part number and then clear the buffer
         CompletableFuture<CompletedPart>[] currentUploads = new CompletableFuture[maxConcurrency];
         int ringIndex = 0;
@@ -60,7 +60,7 @@ public class AsyncMongodumpS3Uploader {
         int bytesRead;
         int currentBufferSize = 0;
 
-        List<CompletedPart> completedParts = Collections.synchronizedList(new ArrayList<>());
+        List<CompletedPart> completedParts = new ArrayList<>();
 
         try {
             while (true) {

@@ -14,7 +14,7 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 public class MongodumpS3Uploader {
-    private static final int PART_SIZE = 5 * 1024 * 1024;  // 5 MB part size
+    private static final int PART_SIZE = 100 * 1024 * 1024;  // In MB
 
     // Method to execute the mongodump command and return an InputStream
     private static InputStream runMongoDump() throws IOException {
